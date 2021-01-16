@@ -1,0 +1,383 @@
+---
+title: "Simulation et estimation des trajets de transport public"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{css, echo=FALSE}
+p {
+  zoom: 120%;
+}
+```
+
+### Objectif
+
+On se propose de simuler des trajets sur des lignes de transport hypothétiques et d'implémenter la méthodologie proposée par Trépanier et al. (2007) afin de déterminer l'arrêt de destination de chaque passager à partir des données de validation (incluant uniquement les arrêts de montée des passagers). Cela permet de mieux analyser et prévoir l'affluence à chaque arrêt, et de mieux adapter l'offre des titres de transport.
+
+
+### Définition du plan de lignes
+
+D'abord on trace un plan hypothétique des arrêts, composé de 4 lignes. Chaque arrêt est identifié par le numéro de ligne en dizaines et le numéro de l'arrêt dans la ligne en unités :
+
+```{r}
+library(magrittr)
+library(ggplot2)
+
+lignes <- lapply(list(1,2,3,4), FUN = function(x) read.csv(paste("ligne",x,".csv",sep = '')))
+arrets <- do.call("rbind", lignes)
+rownames(arrets) <- arrets$id_arret
+
+ggplot(data=arrets, aes(x=x, y=y, group=id_arret%/%10, label = id_arret)) +
+  labs(title="Plan des lignes hypothétiques")+
+  geom_path(color="cornsilk3", size = 2)+
+  geom_point(size=6, shape=21, aes(colour=factor(id_arret%/%10), 
+      fill = factor(id_arret%/%10)), show.legend = F) +
+  geom_text()+
+  theme_minimal()
+
+```
+
+### Définitions préliminaires
+
+Dans la suite on appellera trajet tout usage d'un moyen de transport comportant une montée et une descente sur une même ligne.
+
+Chaque trajet est défini par un départ et une destination.
+
+On appellera correspondances d'un arrêt l'ensemble des arrêts dans un rayon de $M$ km de cet arrêt.
+
+### Calcul des distances
+
+On supposera pour simplifier que cette carte est localement plate. Sinon pour plus de précision il faudrait calculer les distances à partir des longitudes et latitudes grâce à la formule de haversine.
+
+Pour éviter de recalculer les distances entre les arrêts, on les calcule au départ et on les sauvegarde, ainsi que l'ensemble des correspondances possibles à chaque arrêt. On prendra M=2 comme dans Trépanier et al. (2007).
+
+```{r}
+matrice_distances <- as.matrix(dist(arrets[,2:3], diag=T, upper=T))
+correspondances <- apply(matrice_distances, 1, function(x) as.numeric(names(which(x<2))))
+```
+
+### Simulation des trajets
+
+On simule les trajets d'un passager pendant un jour donné par une marche aléatoire entre les arrêts en adoptant les hypothèses suivantes :
+
+1. 20 % des jours on ne fait pas de trajets.
+
+2. Chaque passager a un domicile identifié à un arrêt. Chaque jour où il effectue des trajets, il part d'un arrêt en correspondance avec son domicile avec probabilité 90 %, et d'un arrêt aléatoire avec probabilité 10 %.
+
+3. Le passager effectue une marche aléatoire non uniforme entre les arrêts, qui s'arrête avec probabilité 5 % après chaque trajet, ou sûrement s'il regagne un arrêt en correspondance avec son domicile.
+
+4. Etant dans un arrêt dans une ligne L, on note P l'ensemble de tous les couples uniques ($X_i$: arrêt sur L, $Y_i$ : correspondance possible de $X_i$), ou en d'autres termes l'ensemble des couples (arrêt de descente, prochain arrêt de montée) possibles. Pour éviter que les marches aléatoires soient trop longues, on duplique 15 fois le couple contenant le domicile (s'il existe) et 2 fois les couples dont le prochain arrêt est sur une même ligne qu'une correspondance du domicile. On ajoute également 2 couples (descente, montée) aléatoires pour plus d'aléas, et enfin on choisit uniformément entre tous ces couples pour décider l'arrêt de destination et le prochain départ.
+
+
+```{r}
+set.seed(10)
+n <- 300 # nombre de passagers
+d <- 30 # nombre de jours
+# on fixe le domicile de chaque passager à coté d'une station aléatoire
+sample.vec <- function(x, ...) x[sample(length(x), ...)]
+passagers <- data.frame("id_passager"=1:n, "domicile"=sample(arrets$id_arret, n, replace=T))
+trajets <- data.frame(matrix(ncol = 5, nrow = 0))
+
+depart_depuis_domicile <- matrix(runif(n*d)<.9, nrow=n) # Bernoulli(0.9)
+retour_au_domicile <- matrix(runif(n*d)<.9, nrow=n)
+heure_depart <- matrix(runif(n*d,min=360, max=1320), nrow=n) # heure de départ en minutes, aléatoire
+
+for (i in 1:n){  # passager i
+  for (j in 1:d){  # jour j
+    if (runif(1)<.2) next # 20% de probabilités de ne pas faire de trajets ce jour
+    domicile <- passagers[i,"domicile"]
+    depart <- ifelse(depart_depuis_domicile[i,j], domicile, sample(arrets$id_arret,1))  # arret de depart
+    heure <- heure_depart[i,j]
+    repeat{
+      ligne <- lignes[[depart%/%10]][,1]  # arrets sur la ligne de depart
+      autres_arrets <- ligne[ligne!=depart]
+      # on détermine l'ensemble des couples (descente, prochaine montée) possibles depuis cet arret
+      possibilites_prochain_depart <- c(unlist(sapply(autres_arrets,function(x) correspondances[[paste(x)]])))
+      possibilites_destination <- c(unlist(sapply(autres_arrets,function(x)
+        rep(x,length(correspondances[[paste(x)]])))))
+      possibilites <- rbind(possibilites_prochain_depart, possibilites_destination)
+      
+      # Si le domicile est parmi les possibilités on lui donne plus de probabilité
+      if (length(which(possibilites_prochain_depart==domicile))>0){
+        choix_route <- sample.vec(which(possibilites_prochain_depart==domicile),1)
+        possibilites <- possibilites[,c(1:ncol(possibilites),rep(choix_route,15))]
+      }
+
+      else # On donne plus de probabilité aux correspondances qui mènent au domicile
+        possibilites <- possibilites[,c(1:ncol(possibilites), rep(which(possibilites_prochain_depart%/%10 %in%
+                                                                 c(correspondances[[paste(domicile)]]%/%10)),2))]
+      
+      # Pour plus d'aléas, on ajoute une possibilité de descendre dans un arrêt aléatoire de cet
+      # et avoir un prochain départ aléatoire (cas où on utilise un moyen de transport alternatif)
+      possibilites <- cbind(possibilites,c(sample.vec(arrets[,1],1), sample.vec(autres_arrets,1)),
+                            c(sample.vec(arrets[,1],1), sample.vec(autres_arrets,1)))
+      # on choisit l'une des possibilités
+      choix_route <- sample(dim(possibilites)[2], 1)
+      prochain_depart <- possibilites[1,choix_route]
+      destination <- possibilites[2,choix_route]
+
+      trajets <- rbind(trajets, c(i, j, heure, depart, destination))
+      heure <- heure+sample(5:30,1)
+      depart <- prochain_depart
+      # on passe au jour suivant si on arrive au domicile ou avec probabilité 0.1*0.5
+      if(prochain_depart %in% correspondances[[paste(domicile)]] |
+        (!retour_au_domicile[i,j] & runif(1)<.5))
+          break
+    }
+  }
+}
+colnames(trajets) <- c("id_passager","jour","heure_depart","depart",
+                       "destination")
+```
+
+### Exploration des trajets simulés
+
+Examinons une portion des trajets obtenus :
+```{r}
+head(trajets,20)
+```
+
+On peut créer une animation pour visualiser ces trajets :
+
+```{r, animation.hook="gifski"}
+library(cowplot)
+library(magick)
+jour <- 0
+for (i in 1:20){
+  if (trajets[i,"jour"]!=jour){
+    jour <- trajets[i,"jour"]
+    plot(c(0, 1), c(0, 1), ann = F, bty = 'n', type = 'n', xaxt = 'n', yaxt = 'n')
+    text(x = 0.445, y = 0.41, paste("Jour",jour),cex = 2.7)
+    }
+  for (j in 1:2){
+    print(ggplot(data=arrets, aes(x=x, y=y, group=id_arret%/%10, label = id_arret)) +
+    labs(title=paste("Jour",trajets[i,"jour"]))+
+    geom_path(color="skyblue1", size = 2)+
+    geom_point(size=6, shape=21, aes(colour=factor(id_arret%/%10), 
+        fill = factor(id_arret%/%10)), show.legend = F) +
+    geom_text()+
+    theme_minimal()+
+    expand_limits(y = 21)+
+    draw_image("pion.png",  x = arrets[paste(trajets[i,3+j]),"x"]-.48,
+               y = arrets[paste(trajets[i,3+j]),"y"]+.26, scale = 3))
+  }
+}
+```
+
+Les trajets simulés semblent suffisamment réalistes pour essayer d'estimer les destinations. On dirait même que notre algorithme de simulation passe le test de Turing (difficile de différencier entre ses trajets et des trajets réels).
+
+```{r}
+nb_trajets <- nrow(trajets)
+print(paste("Nombre de trajets simulés :", nb_trajets))
+print(paste("Moyenne du nombre de trajets/personne/jour :", round(nb_trajets/(n*d), 3)))
+```
+
+On obtient 2.35 trajets/p/j en moyenne. En notant que cette moyenne comprend les jours sans trajets, ce nombre semble relativement élevé mais reste acceptable.
+
+Cette simulation nous fournit des données sur lesquelles on peut travailler pour estimer les destinations des trajets. Bien évidemment, on ne peut pas simplement supposer que ces données fourniront des résultats similaires aux données réelles, mais elles permettent d'implémenter et de comprendre la méthodologie étudiée.
+
+### Estimation des destinations
+
+On prépare les données pour l'estimation :
+```{r}
+# On enregistre les destinations dans un vecteur à part, qu'on essayera de déterminer
+destinations <- trajets["destination"]
+# on initialise les estimations à 0
+trajets["destination"] <- 0
+# On ajoute un identifiant pour les trajets
+trajets <- cbind(id_trajet = seq.int(nrow(trajets)), trajets)
+head(trajets,5)
+```
+
+On commence par implémenter l'équation (4) de l’article de Trépanier et al (2007), dans le cas où il existe un et un seul arrêt de la ligne actuelle qui est en correspondance avec le prochain départ. En adoptant la notation de Trépanier et al, cela se traduit par: $\exists ! \; z \in \{V_{rik}\} : r<N_k, \; d(s^B_{(r+1)ik},z)<M$
+
+```{r}
+
+for (i in 1:n){
+  for (j in 1:d){
+    trajets_ij <- trajets[trajets["id_passager"]==i & trajets["jour"]==j,]
+    k <- 1
+    while (k <(nrow(trajets_ij))){
+      depart_actuel <- trajets_ij[k,"depart"]
+      prochain_depart <- trajets_ij[k+1,"depart"]
+      ligne <- lignes[[depart_actuel%/%10]][,1]
+      id_trajet <- trajets_ij[k,"id_trajet"]
+      # Si on est dans une ligne qui mène à une correspondance avec le prochain départ,
+      # alors la destination de ce trajet est l'arrêt de cette correspondance
+      destinations_possibles <- intersect(correspondances[[paste(prochain_depart)]],ligne)
+      if (length(destinations_possibles)==1) # Si on retrouve une unique correspondance possibe
+        trajets$destination[id_trajet] <- destinations_possibles
+      
+    k <- k+1
+    }
+  }
+}
+
+evaluer <- function(){
+estimations_correctes <- sum(trajets["destination"]==destinations)
+estimations_fausses <- sum(trajets["destination"]!=destinations & trajets["destination"]!=0)
+non_estimes <- sum(trajets["destination"]==0)
+
+df <- data.frame(Resultats = c("Estimations correctes", "Estimations incorrectes", "Trajets non estimés"),
+  value = c(estimations_correctes, estimations_fausses, non_estimes),
+  Pourcentage = 100*round(c(estimations_correctes/nb_trajets, estimations_fausses/nb_trajets, non_estimes/nb_trajets), digits = 3))
+
+print(ggplot(df, aes(x = 2, y = value, fill = Resultats)) +
+  labs(title="Résultats des estimations")+
+  geom_bar(stat = "identity", color = "white") +
+  coord_polar(theta = "y", start = 0)+
+  geom_text(aes(label = Pourcentage), position = position_stack(vjust = 0.5), color = "grey20", size = 4.2)+
+  scale_fill_manual(values = c("seagreen3", "tomato", "azure3")) +
+  theme_minimal()+ xlim(0.5, 2.5)+
+  theme(axis.title.y = element_blank(),axis.title.x = element_blank(),axis.text.y=element_blank(),
+  panel.border = element_blank()))
+print(paste("Taux d'erreur :", round(estimations_fausses/(estimations_fausses+estimations_correctes), 3)*100,"%"))
+}
+
+evaluer()
+
+```
+
+Cette méthode simple nous permet d'estimer correctement les destinations de 49 % des trajets, avec un taux d'erreur de 6 % qui est relativement faible. Cela revient à l'intuitivité de cette méthode : Si l'on utilise deux moyens de transport de suite qui ont un unique point de correspondance, il est fort probable qu'on ait emprunté cette correspondance.
+
+Maintenant implémentons le cas général de l'équation (4). Il s'agit des cas où deux arrêts de la ligne actuelle sont en correspondance avec le prochain départ. Par exemple si nous sommes dans la ligne 3 de notre plan hypothétique et notre prochain départ est l'arrêt 23, il se peut qu'on ait descendu à l'arrêt 32 ou bien à l'arrêt 33, puisqu'ils sont tous les deux proches de l'arrêt 23. Dans ce cas on prédit la destination la plus proche du prochain départ : $\underset{z}{\text{argmin}} \; d(s^B_{(r+1)ik},z), \, z \in \{V_{rik}\}, \, r<N_k, \; d(s^B_{(r+1)ik},z)<M$
+
+```{r}
+for (i in 1:n){
+  for (j in 1:d){
+    trajets_ij <- trajets[trajets["id_passager"]==i & trajets["jour"]==j,]
+    k <- 1
+    while (k <(nrow(trajets_ij))){
+      depart_actuel <- trajets_ij[k,"depart"]
+      prochain_depart <- trajets_ij[k+1,"depart"]
+      ligne <- lignes[[depart_actuel%/%10]][,1]
+      id_trajet <- trajets_ij[k,"id_trajet"]
+      
+      destinations_possibles <- intersect(correspondances[[paste(prochain_depart)]],ligne)
+      if (length(destinations_possibles)>1)
+        trajets$destination[id_trajet] <-
+        as.numeric(names(which.min(matrice_distances[paste(prochain_depart),paste(destinations_possibles)])))
+    k <- k+1
+    }
+  }
+}
+
+evaluer()
+normal <- (sum(trajets["destination"]!=0)/nrow(trajets))
+print(paste("Trajets normaux :", round(normal, 3)*100,"%"))
+
+```
+On arrive ainsi à estimer correctement les destinations de 53.4 % des trajets, en amélioration légère par rapport aux derniers résultats, et avec un taux d'erreur plus élevé (12.6 %).
+
+Cela revient aux faits que les cas traités ici sont plus rares, et que lors de la simulation on n'a pas choisi l'arrêt le plus proche de la correspondance mais un arrêt aléatoire menant à la correspondance. On peut donc s'attendre à ce que l'implémentation de cette méthode sur des données réelles n'augmente pas autant le taux d'erreur.
+
+Cette méthode estime 61 % des trajets, appelés "normaux" dans Trépanier et al.
+
+Implémentons maintenant les équations (5) et (6) :
+S'il existe des arrêts de la dernière ligne empreintée cette journée qui sont en correspondance avec le premier départ de cette journée ou de la journée suivante, alors on estime comme destination l'arrêt le plus proche cette correspondance.
+
+```{r}
+for (i in 1:n){
+  for (j in 1:(d-1)){
+    dernier_depart_j <- tail(trajets[trajets["id_passager"]==i & trajets["jour"]==j,],)[1,"depart"]
+    premier_depart_j <- head(trajets[trajets["id_passager"]==i & trajets["jour"]==j,],)[1,"depart"]
+    premier_depart_jp1 <- head(trajets[trajets["id_passager"]==i & trajets["jour"]==j+1,],1)[1,"depart"]
+    id_trajet <- tail(trajets[trajets["id_passager"]==i & trajets["jour"]==j,1],1)
+    # on essaye de déterminer la destination de dernier_trajet_j
+    ligne <- lignes[[dernier_depart_j%/%10]][,1]
+    destinations_possibles <- intersect(correspondances[[paste(premier_depart_j)]],ligne)
+    destinations_possibles_jp1 <- intersect(correspondances[[paste(premier_depart_jp1)]],ligne)
+    
+    if (length(destinations_possibles)==1) trajets$destination[id_trajet] <- destinations_possibles
+    else if (length(destinations_possibles)>1)
+        trajets$destination[id_trajet] <-
+        as.numeric(names(which.min(matrice_distances[paste(prochain_depart),paste(destinations_possibles)])))
+    else if (length(destinations_possibles_jp1)==1)
+      trajets$destination[id_trajet] <- destinations_possibles_jp1
+    else if (length(destinations_possibles_jp1)>1)
+        trajets$destination[id_trajet] <-
+        as.numeric(names(which.min(matrice_distances[paste(prochain_depart),paste(destinations_possibles_jp1)])))
+  }
+  # cas j=d : même chose mais on compare seulement avec le départ de cette journée
+  j <- d
+  dernier_depart_j <- tail(trajets[trajets["id_passager"]==i & trajets["jour"]==j,],)[1,"depart"]
+  premier_depart_j <- head(trajets[trajets["id_passager"]==i & trajets["jour"]==j,],)[1,"depart"]
+  id_trajet <- tail(trajets[trajets["id_passager"]==i & trajets["jour"]==j,1],1)
+  # on essaye de déterminer la destination de dernier_trajet_j
+  ligne <- lignes[[dernier_depart_j%/%10]][,1]
+  destinations_possibles <- intersect(correspondances[[paste(premier_depart_j)]],ligne)
+  if (length(destinations_possibles)==1) trajets$destination[id_trajet] <- destinations_possibles
+  else if (length(destinations_possibles)>1)
+      trajets$destination[id_trajet] <-
+      as.numeric(names(which.min(matrice_distances[paste(prochain_depart),paste(destinations_possibles)])))
+}
+
+evaluer()
+dernier <- (sum(trajets["destination"]!=0)/nrow(trajets) - normal)
+print(paste("Derniers trajets :", round(dernier, 3)*100,"%"))
+
+```
+Cette méthode estime 32.5 % des trajets, appelés derniers (last) dans Trépanier et al.
+
+Pour les mêmes raisons que précédemments, le taux d'erreur est élevé. Néanmoins, il est probable que les destinations incorrectement prédites soient voisines des destinations correctes :
+
+```{r}
+presque_corrects <- round((sum(trajets["destination"]+1 == destinations) + sum(trajets["destination"]-1 == destinations))/sum(trajets["destination"]!=destinations & trajets["destination"]!=0),3)*100
+
+print(paste("Prédictions voisines destinations à estimer :", presque_corrects,"%"))
+
+```
+
+Effectivement, 42 % des erreurs sont à un arrêt près des destinations correctes.
+
+On appelle trajets uniques les trajets non estimés restants.
+Pour chacun de ces trajets, on cherche le trajet du même passager sur la même ligne ayant l'heure de départ la plus proche.
+
+```{r}
+trajets_non_estimes <- which(apply(trajets, 1, function(x) x["destination"]==0))
+for (id_trajet in trajets_non_estimes){
+  depart <- as.numeric(trajets[id_trajet,]["depart"])
+  heure <- as.numeric(trajets[id_trajet,]["heure_depart"])
+  i <- as.numeric(trajets[id_trajet,]["id_passager"])
+  #j <- as.numeric(trajets[id_trajet,]["jour"])
+  trajets_ij <- trajets[trajets["id_passager"]==i & trajets["id_trajet"]!=id_trajet &
+                          trajets["depart"]%/%10==depart%/%10 & trajets["destination"]!=0,]
+  while (dim(trajets_ij)[1]>0){
+    trajet_semblable <- which.min(abs(as.matrix(trajets_ij["heure_depart"]- heure)))
+    if (trajets_ij[trajet_semblable,"destination"] != depart){
+      trajets$destination[id_trajet] <- trajets_ij[trajet_semblable,"destination"]
+      break}
+    else{
+      trajets_ij <- trajets_ij[-trajet_semblable,]
+    }
+  }
+}
+
+evaluer()
+unique <- (sum(trajets["destination"]!=0)/nrow(trajets) - dernier - normal)
+print(paste("Trajets uniques :", round(unique, 3)*100,"%"))
+```
+
+On constate qu'en utilisant cette méthode on arrive à estimer presque toutes les destinations, mais avec un taux d'erreur de 25 % qui est assez élevé. Ceci était prévisible puisque cette méthode repose sur la similarité des horaires des trajets alors que dans notre simulation les horaires sont aléatoires. On s'attend donc à des résultats plus optimistes pour des données réelles.
+
+### Conclusion
+
+Réitérons finalement que ces résultats sont conditionnés par la méthode et les paramètres de simulation. Néanmoins, ils indiquent que sous certaines hypothèses plus ou moins réalistes, on peut estimer correctement la plupart des destinations des trajets, et que même en cas d'erreur on arrive à approximer les destinations réelles d'une grande partie des trajets.
+
+On note également que cette méthode d'estimation est intuitive, simple à implémenter, et relativement rapide à exécuter. Elle peut également s'exprimer sous forme de requêtes SQL qui peuvent être parallélisables sur SparkSQL pour traiter des données de plusieurs millions de trajets en un temps raisonnable.
+
+### Prochaines étapes
+
+En analysant les résultats obtenus avec différents paramètres de simulation, on constate que le taux d'erreur des trajets "normaux" est presque nul dans le cas où il existe un et un seul arrêt de la ligne actuelle qui est en correspondance avec le prochain départ, et augmente avec le nombre de correspondance possibles. Cela nous permet de donner également des probabilités de confiance des estimations.
+
+Des méthodes plus avancées peuvent également être envisagées pour estimer les trajets "uniques" de façon plus fiable, notamment en ajustant un arbre de décision aux trajets "normaux" et "derniers" de chaque passager (qui sont plus faciles à estimer) pour en déduire les destinations des trajets "uniques".
+
+On remarque aussi que la littérature sur ce sujet est très riche et diverses méthodes peuvent être comparées ou fusionnées afin de créer un modèle d'estimation plus robuste.
+
+Une fois les destinations estimées, il sera possible d'analyser les motifs des trajets et identifier les comportements de mobilité des passagers. Selon le travail de Briand et al. (2017) sur ce sujet, une méthodologie possible consiste à classer les les passagers selon leurs horaires de trajets pour en déduire le comportement type de chaque cluster, ce qui permettra par la suite d'adapter l'offre des forfaits et de mieux prédire les affluences.
+
+
+
